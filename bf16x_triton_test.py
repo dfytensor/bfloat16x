@@ -1,14 +1,7 @@
-"""BF16X Triton decode v4 — fix: always load word+1, never same word twice.
+"""BF16X Triton decode v7 — cross-word conditional fix.
 ========================================================
-Root cause: old code loads m_w2 = (m_bit+6)//32, which equals m_w when
-the 7-bit field stays within one word. Then (mw1>>s)|(mw2<<(32-s)) ORs
-two different views of the SAME word, producing garbage.
-
-Fix: always load m_w+1 (guaranteed different word), use single formula:
-    mant_raw = (mw1 >> s) | (mw2 << (32-s))
-For non-cross: mw2 bits shifted to >=7, masked by &0x7F.
-For cross:     mw2 low bit(s) fill the gap, masked by &0x7F.
-This works correctly for ALL offset values.
+Root cause: (mw1>>0)|(mw2<<32) — <<32 is UB in Triton (garbage).
+Fix: (m_s+7)>32 check before cross-word load. Same for delta, sign.
 """
 import sys, time, torch
 sys.path.insert(0, r'E:\minimax_h3_run')
@@ -20,33 +13,39 @@ def _bf16x_decode_kernel(
     sign_ptr, mant_ptr, delta_ptr, emax_ptr, out_ptr,
     N: tl.constexpr, BLOCK: tl.constexpr,
 ):
-    """v4: always load word+1 for cross-word bit extraction, no conditional."""
+    """v7: conditional cross-word load, avoids <<32 UB."""
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < N
+    Z = tl.zeros((BLOCK,), tl.int32)
 
-    # Sign (1 bit): uint32 逻辑右移
+    # Sign (1 bit): always single word
     s_w = offs // 32; s_b = offs % 32
     sw = tl.load(sign_ptr + s_w, mask=mask, other=0)
     sign = (sw.to(tl.uint32) >> s_b) & 1
 
-    # Mantissa (7 bits): uint32 逻辑右移, 免符号扩展
+    # Mantissa (7 bits): cross if (m_s + 7) > 32
     m_bit = offs * 7; m_w = m_bit // 32; m_s = m_bit % 32
     mw1 = tl.load(mant_ptr + m_w, mask=mask, other=0)
-    mw2 = tl.load(mant_ptr + m_w + 1, mask=mask, other=0)
-    mant = ((mw1.to(tl.uint32) >> m_s) | (mw2.to(tl.uint32) << (32 - m_s))) & 0x7F
+    cross_m = (m_s + 7) > 32
+    mw2 = tl.where(cross_m, tl.load(mant_ptr + m_w + 1, mask=mask, other=0), Z)
+    mr = tl.where(cross_m, (mw1.to(tl.uint32) >> m_s) | (mw2.to(tl.uint32) << (32 - m_s)),
+                  mw1.to(tl.uint32) >> m_s)
+    mant = mr & 0x7F
 
-    # Delta (3 bits): uint32 逻辑右移
+    # Delta (3 bits): cross if (d_s + 3) > 32
     d_bit = offs * 3; d_w = d_bit // 32; d_s = d_bit % 32
     dw1 = tl.load(delta_ptr + d_w, mask=mask, other=0)
-    dw2 = tl.load(delta_ptr + d_w + 1, mask=mask, other=0)
-    delta = ((dw1.to(tl.uint32) >> d_s) | (dw2.to(tl.uint32) << (32 - d_s))) & 0x7
+    cross_d = (d_s + 3) > 32
+    dw2 = tl.where(cross_d, tl.load(delta_ptr + d_w + 1, mask=mask, other=0), Z)
+    dr = tl.where(cross_d, (dw1.to(tl.uint32) >> d_s) | (dw2.to(tl.uint32) << (32 - d_s)),
+                  dw1.to(tl.uint32) >> d_s)
+    delta = dr & 0x7
 
     # Emax (8 bits per 16 elements)
     ei = offs // 16
     e = tl.load(emax_ptr + ei, mask=mask, other=0)
 
-    # Reconstruct bf16
     e = e.to(tl.int32); delta = delta.to(tl.int32)
     exp = tl.maximum(e - delta, 0); exp = tl.minimum(exp, 255)
     bf16 = ((sign.to(tl.int32) << 15) | (exp << 7) | mant.to(tl.int32)).to(tl.uint16)
