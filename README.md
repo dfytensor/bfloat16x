@@ -1,6 +1,7 @@
 # BF16X — BFloat16 Lossless Compression
 
 > **100% bit-identical** decompression, **2.08× compression ratio**, full Triton GPU kernel.
+> **v8: fused decode+GEMV — generation speed parity with bf16** (34.8 vs 33-36 ms/tok on MiniCPM5-1B).
 
 BF16X compresses bfloat16 model weights losslessly by exploiting exponent redundancy: adjacent weights share an `emax` (8-bit per 16 elements), with individual deltas stored in only 3 bits. Sign + mantissa are packed as bit-streams. Overflows (rare delta ≥ 7) are handled by a Triton-based sparse fix kernel.
 
@@ -92,11 +93,36 @@ Decompression (GPU, Triton):
 
 ## MiniCPM5-1B Benchmark (RTX 4090 24GB)
 
-| Mode | Fwd | GPU | ppl | Quality |
+| Mode | Gen (ms/tok) | GPU | ppl | Quality |
 |---|---|---|---|---|
-| bf16 original | 36ms | 2.2GB | 56.02 | 100% |
-| **BF16X GPU real-time** | 105ms | 2.0GB | **56.02** | **100% lossless** |
-| BF16X CPU streaming | 128ms | 0.9GB | 56.02 | 100% lossless |
+| bf16 original | 33-36 | 2.2GB | 56.02 | 100% |
+| **v8 fused decode+GEMV** | **34.8 (≈bf16)** | **1.98GB** | **56.02** | **100% lossless** |
+| v8 opt two-segment | 48.4 | 2.0GB | 56.02 | 100% lossless |
+| v6 GPU real-time (per-call) | 353.8* | 2.0GB | 56.02 | 100% lossless |
+| CPU streaming | — | 0.9GB | 56.02 | 100% lossless |
+
+\* KV-cache greedy generation, WDDM desktop GPU amplifies the per-layer CPU
+sync + DMA cost of the original decode loop.
+
+### v8 fused kernel (`bf16x_fused.py`)
+
+Single-token GEMV with in-register decode — the bf16 weight **never
+materializes in VRAM** (reads ~12.3 bpw packed instead of a 32 bpw
+decode-write + GEMM-read round trip). The overflow table (delta ≥ 7) becomes
+a per-row CSR overlay corrected **inside** the kernel
+(`w_corr − w_wrong`·x accumulated directly, no second pass, no CPU sync).
+R rows per program (R=4, BK=256 measured best); `out_f % R` auto-fallback.
+
+```python
+from bf16x_fused import deploy_bf16x_fused, Bf16xFused
+
+model = ...  # cuda, eval
+deploy_bf16x_fused(model)            # replaces all quantizable Linears
+# modes per layer: 'fused' (default, single-token) / 'opt' / 'repo';
+# multi-token prefill always uses the shared-buffer decode + F.linear
+```
+
+Reproduce: `python bench_fused_cpm5.py`
 
 - **Disk compression**: 2161MB → 1041MB (2.08×)
 - **Triton kernels**: 100% of decode pipeline
@@ -107,7 +133,9 @@ Decompression (GPU, Triton):
 | File | Purpose |
 |---|---|
 | `opqk_linear.py` | `bf16x_quantize()`, `BF16XLinear` (Python decode fallback) |
-| `bf16x_triton_test.py` | **Triton kernels v6** + `bf16x_decode_triton()` API |
+| `bf16x_triton_test.py` | **Triton kernels v7** + `bf16x_decode_triton()` API |
+| `bf16x_fused.py` | **v8: fused decode+GEMV kernel** + `Bf16xFused` (3 modes) + `deploy_bf16x_fused()` |
+| `bench_fused_cpm5.py` | bf16 vs repo/opt/fused benchmark on MiniCPM5-1B |
 | `compress_bf16x.py` | CPU compression script |
 | `compress_bf16x_gpu.py` | GPU batch compression |
 | `BF16X.md` | Full documentation with inline kernel code |
