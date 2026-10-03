@@ -105,6 +105,23 @@ Decompression (GPU, Triton):
 \* KV-cache greedy generation, WDDM desktop GPU amplifies the per-layer CPU
 sync + DMA cost of the original decode loop.
 
+### llama.cpp `GGML_TYPE_BF16X` end-to-end (MiniCPM5-1B, wikitext-2 test, RTX 4090)
+
+Full integration via the llama.cpp PR branch (CUDA backend, -ngl 99,
+wikitext-2 test split, ctx 2048):
+
+| Format | Size | BPW | PPL |
+|---|---|---|---|
+| F16 baseline | 2061 MiB | 16.00 | 21.0155 ± 0.172 |
+| **BF16X** | **1482 MiB** | **11.50** | **21.0076 ± 0.173** |
+| Q8_0 | 1095 MiB | 8.50 | 21.0102 ± 0.173 |
+
+BF16X is statistically indistinguishable from F16 (delta ≪ the error bar)
+while shrinking the file by 1.39x; `llama-perplexity` runs on the quantized
+CUDA kernels (mul_mm for prefill, MMVQ for generation, 306 tok/s gen /
+163 tok/s pp on the 1B model), and the CPU vec-dot path agrees
+(19.84 vs 19.85 ppl on a 60 KB subset).
+
 ### v8 fused kernel (`bf16x_fused.py`)
 
 Single-token GEMV with in-register decode — the bf16 weight **never
