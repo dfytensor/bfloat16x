@@ -2,6 +2,7 @@
 
 > **100% bit-identical** decompression, **2.08× compression ratio**, full Triton GPU kernel.
 > **v8: fused decode+GEMV — generation speed parity with bf16** (34.8 vs 33-36 ms/tok on MiniCPM5-1B).
+> **v9: fused decode+GEMM — multi-token/prefill** (8B image model t2i: 103 s → 56 s/image, 1.84×, 24 GB GPU).
 
 BF16X compresses bfloat16 model weights losslessly by exploiting exponent redundancy: adjacent weights share an `emax` (8-bit per 16 elements), with individual deltas stored in only 3 bits. Sign + mantissa are packed as bit-streams. Overflows (rare delta ≥ 7) are handled by a Triton-based sparse fix kernel.
 
@@ -124,6 +125,55 @@ deploy_bf16x_fused(model)            # replaces all quantizable Linears
 
 Reproduce: `python bench_fused_cpm5.py`
 
+### v9 fused decode+GEMM (`bf16x_gemm_fused.py`)
+
+Multi-token counterpart of the v8 GEMV: W tiles are decoded **in registers**
+and fed to `tl.dot` — the bf16 weight never materializes in VRAM, so the hot
+path reads ~11.9 bpw packed instead of a 32 bpw decode-write + GEMM-read round
+trip. Handles arbitrary `out_f` / `in_f` / `M` (masked edges); decode tile
+lives in smem (BN×BK = 128×32 best).
+
+delta==7 saturation applies (near-lossless: true delta>7 hits ~2% of elements;
+verified bit-exact vs the saturated decode with one-hot probes). Bit-exact
+multi-token: two-segment decode; bit-exact single-token: v8 GEMV.
+
+Measured on SenseNova-U1.5-8B-MoT t2i (588 Linears, 16:9 2720×1536, 10 steps,
+RTX 4090 24 GB): **103 s → 56 s per image (1.84×)** vs the two-segment
+DMA→decode→F.linear path, with the backbone (294 Linears) GPU-resident
+zero-DMA and the fp32-origin branch (294 Linears) pinned-CPU + DMA.
+
+```python
+from bf16x_gemm_fused import Bf16xGemmLinear, bf16x_fused_gemm, deploy_bf16x_gemm
+
+deploy_bf16x_gemm(model)   # in-memory: quantize + replace all Linears
+# or per-layer:
+lay = Bf16xGemmLinear(packed, bias=b, resident=False)   # resident=False -> pinned CPU + DMA
+y = model(x)               # prefill / image models / any M > 1
+```
+
+### Offline pack to disk (`pack_to_disk.py`)
+
+One-time packing of a whole model into a **single safetensors + meta JSON**,
+layer-by-layer on CPU with the original dropped immediately (host-RAM peak ≈
+packed streams + one layer: a 50 GB 8B model packs in ~26 GB RAM). Loading
+mmap-slices the blob per layer — no re-quantization at startup (62 s for a
+588-linear 8B model). The loader provides two-segment **bit-exact** inference
+with GPU-resident or pinned-CPU-streamed layers; packed layers can also feed
+the fused kernels above.
+
+```python
+from pack_to_disk import pack_model_to_disk, replace_linears_from_packed
+
+pack_model_to_disk(model, "model_bf16x")            # once, offline
+replace_linears_from_packed(model, "model_bf16x",   # at startup
+    resident_fn=lambda name: "mot" not in name)     # GPU-resident vs CPU+DMA
+```
+
+Format `bf16x-v1`: `<prefix>.safetensors` holds flat streams per layer
+(`<name>.{sign,mant,delta,emax,ovf_i,ovf_v,bias}`), `<prefix>.meta.json` the
+per-tensor offsets/shapes. WDDM note: stream pinned pools in ≤256 MB chunks —
+repeated multi-GB pins fragment the Windows host allocator.
+
 - **Disk compression**: 2161MB → 1041MB (2.08×)
 - **Triton kernels**: 100% of decode pipeline
 - **Global shared buffer**: 1 decode buffer reused across all 168 layers
@@ -135,6 +185,8 @@ Reproduce: `python bench_fused_cpm5.py`
 | `opqk_linear.py` | `bf16x_quantize()`, `BF16XLinear` (Python decode fallback) |
 | `bf16x_triton_test.py` | **Triton kernels v7** + `bf16x_decode_triton()` API |
 | `bf16x_fused.py` | **v8: fused decode+GEMV kernel** + `Bf16xFused` (3 modes) + `deploy_bf16x_fused()` |
+| `bf16x_gemm_fused.py` | **v9: fused decode+GEMM kernel** (multi-token) + `Bf16xGemmLinear` + `deploy_bf16x_gemm()` |
+| `pack_to_disk.py` | **Offline pack**: whole model → one safetensors + meta; bit-exact streaming loader |
 | `bench_fused_cpm5.py` | bf16 vs repo/opt/fused benchmark on MiniCPM5-1B |
 | `compress_bf16x.py` | CPU compression script |
 | `compress_bf16x_gpu.py` | GPU batch compression |
