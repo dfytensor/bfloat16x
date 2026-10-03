@@ -126,18 +126,17 @@ CUDA kernels (mul_mm for prefill, MMVQ for generation, 306 tok/s gen /
 
 | Format | Size | pp512 | tg128 |
 |---|---|---|---|
-| F16 | 2.01 GiB | 41153 t/s | 365.3 ± 3.0 |
-| BF16X | 1.45 GiB | 31046 t/s | 347.3 ± 2.2 |
-| Q8_0 | 1.07 GiB | 44756 t/s | 514.6 ± 1.2 |
+| F16 | 2.01 GiB | 40388 t/s | 364.9 ± 1.2 |
+| BF16X | 1.45 GiB | 30546 t/s | **365.9 ± 1.1** |
+| Q8_0 | 1.07 GiB | 43719 t/s | 507.9 ± 0.9 |
 
-Honest read: at this model size the current BF16X MMVQ kernel is
-**ALU-bound, not bandwidth-bound** — per-element shift/extract decode
-(~15 ops/weight, scalar int8 x float) costs more than the 28% bandwidth
-saving returns, so tg is ~5% behind F16 (Q8_0's dp4a int8 path wins big).
-The bandwidth ceiling for 1.45 GiB is ~680 tok/s; closing the gap needs
-packed uint32 bit-stream loads (the trick `bf16xl_lossless.py`'s CUDA GEMV
-uses) and/or an int8 MMQ path — both are follow-up work. Today's value
-proposition is **28% smaller at F16-parity quality**, not speed.
+After the uint32 funnel-shift MMVQ decode kernel (bit-streams hoisted into
+registers, 7 loads per 16 weights instead of 48 byte loads), BF16X
+generation is **at F16 parity with 28% less memory**. The bandwidth ceiling
+for 1.45 GiB is ~680 tok/s — closing the remaining gap needs an int8 MMQ
+path or dp4a-style decode (follow-up work). Prefill (mul_mm dequant+MMA)
+still trails F16's pure-MMA path at this size; today's value proposition is
+**28% smaller at F16-parity quality and speed**.
 
 ### v8 fused kernel (`bf16x_fused.py`)
 
