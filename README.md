@@ -122,6 +122,23 @@ CUDA kernels (mul_mm for prefill, MMVQ for generation, 306 tok/s gen /
 163 tok/s pp on the 1B model), and the CPU vec-dot path agrees
 (19.84 vs 19.85 ppl on a 60 KB subset).
 
+### llama.cpp speed (llama-bench, MiniCPM5-1B, RTX 4090, -ngl 99)
+
+| Format | Size | pp512 | tg128 |
+|---|---|---|---|
+| F16 | 2.01 GiB | 41153 t/s | 365.3 ± 3.0 |
+| BF16X | 1.45 GiB | 31046 t/s | 347.3 ± 2.2 |
+| Q8_0 | 1.07 GiB | 44756 t/s | 514.6 ± 1.2 |
+
+Honest read: at this model size the current BF16X MMVQ kernel is
+**ALU-bound, not bandwidth-bound** — per-element shift/extract decode
+(~15 ops/weight, scalar int8 x float) costs more than the 28% bandwidth
+saving returns, so tg is ~5% behind F16 (Q8_0's dp4a int8 path wins big).
+The bandwidth ceiling for 1.45 GiB is ~680 tok/s; closing the gap needs
+packed uint32 bit-stream loads (the trick `bf16xl_lossless.py`'s CUDA GEMV
+uses) and/or an int8 MMQ path — both are follow-up work. Today's value
+proposition is **28% smaller at F16-parity quality**, not speed.
+
 ### v8 fused kernel (`bf16x_fused.py`)
 
 Single-token GEMV with in-register decode — the bf16 weight **never
