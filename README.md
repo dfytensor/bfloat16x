@@ -195,6 +195,35 @@ repeated multi-GB pins fragment the Windows host allocator.
 - **Triton kernels**: 100% of decode pipeline
 - **Global shared buffer**: 1 decode buffer reused across all 168 layers
 
+### GGUF block format (llama.cpp `GGML_TYPE_BF16X`)
+
+The llama.cpp integration (PR branch, CPU + CUDA + Metal kernels) uses a
+self-contained fixed-rate block layout — reference implementation with
+round-trip self-test: `bf16x_gguf_block.py`.
+
+```
+32 weights per block, 46 bytes (11.5 bpw):
+  emax[2]   one byte per 16-weight half = shared max bf16 exponent
+  sgn[4]    32 sign bits, LSB-first
+  mant[28]  32 x 7-bit mantissas, LSB-first bit order
+  delta[12] 32 x 3-bit exponent deltas, LSB-first; 7 = saturate (exp = emax-7)
+```
+
+Weights within 6 exponents of their half-block max decode bit-identical to
+the original bf16 (~99% of bits on real checkpoints); sign + mantissa are
+always exact. Measured end-to-end in llama.cpp on MiniCPM5-1B
+(wikitext-2 test, RTX 4090): PPL 21.0076 vs F16's 21.0155 (+/- 0.17) at
+11.50 BPW.
+
+### Lossless variant (`bf16xl_lossless.py`)
+
+TRUE-lossless sibling at **14.12 bpw**: per 16-element group a 28-byte
+LSB-first stream of `val14 = (delta6 << 8) | (mant7 << 1) | sign`
+(delta 63 = zero marker; delta > 62 folded to zero), one emax byte per
+64 elements. Reconstruction is bit-identical (verified). Includes a
+warp-per-row CUDA GEMV (byte-assembly loads, generation-speed parity with
+a plain bf16 GEMV) and a `deploy_bf16xl()` model hook.
+
 ## File Reference
 
 | File | Purpose |
@@ -204,6 +233,8 @@ repeated multi-GB pins fragment the Windows host allocator.
 | `bf16x_fused.py` | **v8: fused decode+GEMV kernel** + `Bf16xFused` (3 modes) + `deploy_bf16x_fused()` |
 | `bf16x_gemm_fused.py` | **v9: fused decode+GEMM kernel** (multi-token) + `Bf16xGemmLinear` + `deploy_bf16x_gemm()` |
 | `pack_to_disk.py` | **Offline pack**: whole model → one safetensors + meta; bit-exact streaming loader |
+| `bf16xl_lossless.py` | **TRUE-lossless variant** (14.12 bpw) + CUDA GEMV/decode + `deploy_bf16xl()` |
+| `bf16x_gguf_block.py` | **GGUF block format reference** (llama.cpp GGML_TYPE_BF16X) + self-test |
 | `bench_fused_cpm5.py` | bf16 vs repo/opt/fused benchmark on MiniCPM5-1B |
 | `compress_bf16x.py` | CPU compression script |
 | `compress_bf16x_gpu.py` | GPU batch compression |
