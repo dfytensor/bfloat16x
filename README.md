@@ -142,6 +142,20 @@ The bandwidth ceiling for 1.45 GiB is ~680 tok/s (currently ~56%); an int8
 MMQ path or dp4a-style decode can push further (follow-up). Prefill
 (mul_mm dequant+MMA) still trails F16's pure-MMA path at this size.
 
+**Scaling** — every token carries ~1 ms of format-independent fixed cost
+(kernel launches across ~200 tensors, sync, sampling), which amortizes as
+models grow, so the BF16X/F16 speed ratio converges to the 1.39x bandwidth
+ratio (MiniCPM5-1B and Qwen2.5-3B, same GPU, tg128):
+
+| Model | BF16X size | F16 tg | BF16X tg | speedup |
+|---|---|---|---|---|
+| MiniCPM5-1B | 1.45 GiB | 371 t/s | 389 t/s | 1.05x |
+| Qwen2.5-3B | 4.13 GiB | 124.6 t/s | 159.3 t/s | **1.28x** |
+
+Quality holds on the second architecture too: Qwen2.5-3B ppl 6.7198 vs
+F16's 6.7192 (+/- 0.197). At 7B-8B sizes expect ~1.3x+; the effective
+bandwidth at 3B already reaches 658 GB/s (65% of peak).
+
 ### v8 fused kernel (`bf16x_fused.py`)
 
 Single-token GEMV with in-register decode — the bf16 weight **never
