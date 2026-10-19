@@ -156,11 +156,47 @@ The per-token fixed cost (~1 ms of kernel launches across ~200 tensors) is forma
 
 ---
 
-## 9. Asks
+## 9. GEMM-enablement roadmap (three paths)
+
+Making bf16xl GEMM-capable hinges on one constraint: **decode must complete at (or immediately before) the operand-capture stage of the MMA pipeline, with no per-element scaling leaking into the summation.** Three paths, in order of verification cost:
+
+### Path 1 — fused decode: reconstruct BF16 tiles in registers (near-term, software)
+
+"Load-compressed, compute-decompressed": decode bit streams into standard BF16 fragments in registers/shared memory immediately before `mma.sync`, exactly as Marlin-style int4 kernels and llama.cpp's own MMQ kernels dequantize into fragments. **This is not hypothetical for us — the funnel-shift MMVQ kernel in the PR branch is already fused decode for M=1..8** (no HBM round trip; decode overlapped with FMA). The missing piece is the batched (M>1) Marlin-style bf16x MMQ kernel, which answers the key open question — *how much of the 28% byte saving survives fusion* — with a prototype instead of an argument.
+
+### Path 2 — fixed-function decode cascade (the architecture ask)
+
+Per-element exponent alignment as a fixed pipeline stage in the tensor-core front-end: bit-plane reassembly + `emax - delta` adder per operand element, before the multiply array. This generalizes the MX block-scale logic (which applies one correction per block pre-accumulation, e.g. MXCore-style datapaths) to per-element granularity. The brief's §5 cost analysis (1.5 weights/cycle/SM, shifter/mux only) bounds the area question; the argument to make is that this increment buys losslessness that block-scale MX structurally cannot.
+
+### Path 3 — format restructure for decode regularity (measured: mostly not worth it)
+
+Proposal: split the 64-element group into 16-element sub-blocks with a sub-block base delta and 2-bit per-element offsets, mapping decode closer to MX block scales. **Measured verdict on real weights** (14.3M half-blocks, MiniCPM5-1B, 8 tensors): intra-half exponent spread is ≤ 3 for only **10.49%** of halves — a 2-bit offset is lossy for ~90% of blocks and breaks the lossless property. Corrected hierarchy options:
+
+| sub-block offset width | lossless coverage | bpw (with emax byte, sign, 7b mantissa) |
+|---|---|---|
+| 3-bit (spread ≤ 7) | 86.45% | 12.0 |
+| 4-bit (spread ≤ 15) | **99.94%** | **12.5** |
+
+A 4-bit-offset variant is a legitimate point between BF16X (11.5 bpw, ~99% exact) and bf16xl (14.12 bpw, 100%) — but note it is a delta-width knob on the existing design, and per-element offsets still exist, so it does not by itself buy GEMM-ability.
+
+### Shared constraints (all paths)
+
+1. **Branchless decode** — fixed-rate encoding keeps per-thread decode work deterministic (the SIMT advantage over Huffman/ANS formats; our CUDA kernel branches only on compile-time constants).
+2. **Decode/MMA overlap** — decode the next tile while `mma` consumes the current one (standard software pipelining); decode must never serialize in front of the GEMM.
+3. **Register/smem pressure** — a decoded BF16 tile is 16 bpw vs 14.12 compressed; the roofline must charge the tile staging bandwidth (this is exactly what the Path-1 prototype measures).
+
+### Citation hygiene note
+
+Widely-cited verified anchors for this dataflow: **Marlin** (fused int4-dequant into `mma.sync` fragments), **QServe** (W4A8 fused-dequant serving), **ZipNN** and **DFloat11** (lossless exponent coding precedents), **BitPragmatic** (bit-plane compute). Other recently-surfaced system names (e.g. fused BF16-compression GEMM engines) should be independently verified on Google Scholar before inclusion in any submission — unverified citations are fatal in this venue.
+
+---
+
+## 10. Asks
 
 1. **OCP MX working group**: consider an "MX-BF16 lossless" profile (shared exponent + 6-bit delta + full mantissa) as a storage/streaming variant of the MX family.
 2. **Vendors (NVIDIA/AMD/Intel)**: a fixed-rate bit-plane decode cascade between L2 and the MMA operand path (§5) — shifter/mux wiring, ~1 stage, per-SM lane count of ~2.
 3. **Patent**: pipelined decode-unit for fixed-rate bit-plane lossless weight formats (layout + data path as specified) — to be filed before any submission.
+4. **Near-term (software-only)**: authorize the batched fused-decode prototype (Path 1, Marlin-style bf16x MMQ) to replace the dequant+cuBLAS fallback — it converts the batched-decode wall from an argument into a measurement.
 
 ---
 
