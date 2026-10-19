@@ -1,4 +1,4 @@
-﻿"""BF16X GGUF block format 鈥?reference packer/unpacker (llama.cpp GGML_TYPE_BF16X).
+"""BF16X GGUF block format 鈥?reference packer/unpacker (llama.cpp GGML_TYPE_BF16X).
 
 This is the on-disk layout used by llama.cpp's GGML_TYPE_BF16X (type 43),
 documented here as executable reference code:
@@ -81,7 +81,7 @@ def dequantize_blocks(packed: np.ndarray) -> np.ndarray:
     sign = _unpack_bits(p[:, 2:6], 1)
     mant = _unpack_bits(p[:, 6:34], 7)
     delta = _unpack_bits(p[:, 34:46], 3)
-    expo = np.maximum(emax - delta, 0)
+    expo = np.where(delta == 7, 0, np.maximum(emax - delta, 0))  # d==7: zero marker
     bits = (sign << 15) | (expo << 7) | mant
     f32 = bf16_bits_to_fp32(bits)
     return f32.reshape(*packed.shape[:-2], packed.shape[-2] * 32)
