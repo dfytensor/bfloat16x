@@ -269,6 +269,7 @@ a plain bf16 GEMV) and a `deploy_bf16xl()` model hook.
 | `pack_to_disk.py` | **Offline pack**: whole model → one safetensors + meta; bit-exact streaming loader |
 | `bf16xl_lossless.py` | **TRUE-lossless variant** (14.12 bpw) + CUDA GEMV/decode + `deploy_bf16xl()` |
 | `bf16x_gguf_block.py` | **GGUF block format reference** (llama.cpp GGML_TYPE_BF16X) + self-test |
+| `docs/TECH_BRIEF.md` | **Hardware submission brief**: format spec, decode-unit microarchitecture, roofline, fp8-split impossibility argument, measured evidence |
 | `bench_fused_cpm5.py` | bf16 vs repo/opt/fused benchmark on MiniCPM5-1B |
 | `compress_bf16x.py` | CPU compression script |
 | `compress_bf16x_gpu.py` | GPU batch compression |
