@@ -317,6 +317,11 @@ inside `llama_model_base::create_tensor` and applies the corrections in
 bit-exact path without per-model code. The two new ops are
 `GGML_OP_SPARSE_MM` and `GGML_OP_SPARSE_ROWS` (CPU + CUDA kernels).
 
+The lossless GGUFs work in `llama-server` as well: parallel slots and
+continuous batching exercise the multi-token path of the same kernels
+(4 concurrent requests on Qwen2.5-3B: 305.9 tok/s aggregate vs 111 tok/s
+single stream, identical greedy output to `llama-cli`).
+
 Measured (RTX 4090 D, temp 0, weights 100% bit-exact):
 
 | model | 11.5 bpw | 12.17 bpw | decode delta |
