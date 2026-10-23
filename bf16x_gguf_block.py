@@ -93,6 +93,106 @@ def quantize_tensor(x: np.ndarray) -> np.ndarray:
     return quantize_blocks(x)
 
 
+# ---------------------------------------------------------------------------
+# Lossless overflow side table (BF16X-L)
+#
+# quantize_blocks() clamps any exponent delta >= 7 to the zero marker, which
+# loses ~2% of real weights (the ones more than 6 exponents below their
+# 16-element half-block max). The side table stores those elements exactly,
+# turning BF16X into a true-lossless format at ~12 bpw:
+#
+#   u32 n_rows
+#   u32 n_entries
+#   u32 row_off[n_rows + 1]          entry index where each row starts
+#   { u16 col, u16 bf16_bits }[n_entries]
+#
+# Entries are sorted by row, then column. Column indices fit in u16 because
+# ne0 <= 65535 for all supported tensors. Applying the table restores the
+# original bf16 bit pattern of every element.
+# ---------------------------------------------------------------------------
+
+OVF_HDR_BYTES = 8
+
+
+def _bf16_bits(x: np.ndarray, bf16_exact: bool) -> np.ndarray:
+    """bf16 bit patterns of x; bf16_exact skips the (no-op) rounding."""
+    if bf16_exact:
+        u = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32)
+        return (u >> 16).astype(np.uint16)
+    return fp32_to_bf16_bits(x)
+
+
+def _ovf_mask_from_bits(bits: np.ndarray, rows: int, cols: int) -> np.ndarray:
+    expo = ((bits >> 7) & 0xFF).astype(np.int32)
+    e = expo.reshape(rows, cols // QK_BF16X, QK_BF16X)
+    emax = np.maximum(e.reshape(rows, cols // QK_BF16X, 2, 16).max(axis=-1), 7)
+    delta = emax[..., None].repeat(16, axis=-1).reshape(rows, cols // QK_BF16X, QK_BF16X) - e
+    mask = delta.reshape(rows, cols) >= 7
+    # exact zeros (+0.0 / -0.0) already decode correctly via the zero marker
+    return mask & ((bits & 0x7FFF) != 0)
+
+
+def ovf_overflow_mask(x: np.ndarray, bf16_exact: bool = False) -> np.ndarray:
+    """(rows, cols) bool mask of elements that quantize_blocks() clamps."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    rows, cols = x.shape
+    assert cols % QK_BF16X == 0
+    return _ovf_mask_from_bits(_bf16_bits(x, bf16_exact), rows, cols)
+
+
+def pack_ovf(x: np.ndarray, bf16_exact: bool = False) -> bytes:
+    """(rows, cols) weight -> serialized overflow table (possibly empty)."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    rows, cols = x.shape
+    bits = _bf16_bits(x, bf16_exact)
+    ovf = _ovf_mask_from_bits(bits, rows, cols)
+    r, c = np.nonzero(ovf)  # row-major order: sorted by row, then col
+    row_off = np.zeros(rows + 1, dtype=np.uint32)
+    if r.size:
+        np.cumsum(np.bincount(r, minlength=rows), out=row_off[1:])
+        entries = np.empty((r.size, 2), dtype=np.uint16)
+        entries[:, 0] = c.astype(np.uint16)
+        entries[:, 1] = bits[r, c]
+    else:
+        entries = np.empty((0, 2), dtype=np.uint16)
+    hdr = np.array([rows, r.size], dtype=np.uint32)
+    return hdr.tobytes() + row_off.tobytes() + entries.tobytes()
+
+
+def unpack_ovf(blob: bytes) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """-> (n_rows, row_off, entries[:, 0]=col, entries[:, 1]=bf16 bits)."""
+    hdr = np.frombuffer(blob[:OVF_HDR_BYTES], dtype=np.uint32)
+    rows, n_entries = int(hdr[0]), int(hdr[1])
+    off = OVF_HDR_BYTES
+    row_off = np.frombuffer(blob[off:off + 4 * (rows + 1)], dtype=np.uint32)
+    off += 4 * (rows + 1)
+    ent = np.frombuffer(blob[off:off + 4 * n_entries], dtype=np.uint16).reshape(-1, 2)
+    return rows, row_off, ent[:, 0], ent[:, 1]
+
+
+def apply_ovf(decoded: np.ndarray, blob: bytes) -> np.ndarray:
+    """Overwrite the clamped elements of a dequantized (rows, cols) tensor."""
+    rows, row_off, cols, bits = unpack_ovf(blob)
+    assert decoded.shape[0] == rows, (decoded.shape, rows)
+    flat_r = np.repeat(np.arange(rows, dtype=np.int64), np.diff(row_off).astype(np.int64))
+    decoded = decoded.copy()
+    decoded[flat_r, cols.astype(np.int64)] = bf16_bits_to_fp32(bits)
+    return decoded
+
+
+def dequantize_lossless(packed: np.ndarray, blob: bytes) -> np.ndarray:
+    """packed blocks (..., 46) + overflow blob -> exact float32 weights (flat)."""
+    dec = dequantize_blocks(packed).reshape(-1)
+    rows = int(unpack_ovf(blob)[0])
+    return apply_ovf(dec.reshape(rows, -1), blob).reshape(-1)
+
+
+def ovf_stats(x: np.ndarray) -> tuple[int, int]:
+    """-> (n_overflow, n_elements)."""
+    x = np.ascontiguousarray(x, dtype=np.float32)
+    return int(ovf_overflow_mask(x).sum()), x.size
+
+
 if __name__ == '__main__':
     try:
         import torch

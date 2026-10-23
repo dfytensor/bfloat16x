@@ -289,6 +289,31 @@ always exact. Measured end-to-end in llama.cpp on MiniCPM5-1B
 (wikitext-2 test, RTX 4090): PPL 21.0076 vs F16's 21.0155 (+/- 0.17) at
 11.50 BPW.
 
+#### Bit-exact extension (overflow side table, ~12.1 bpw)
+
+`quantize_blocks()` clamps every exponent delta >= 7 to the zero marker,
+which is the only lossy part of the format: ~1.9% of real weights (the ones
+> 6 exponents below their 16-element half-block max, ~0.6 bpw worth).
+`bf16x_gguf_block.py` now also provides the sparse side table used by the
+reference Python implementation:
+
+```
+u32 n_rows, u32 n_entries
+u32 row_off[n_rows + 1]
+{ u16 col, u16 bf16_bits }[n_entries]     (sorted by row, then column)
+```
+
+`pack_ovf()` / `apply_ovf()` / `dequantize_lossless()` produce and apply it.
+Verified on RWKV7-G1k-0.1B: **168 tensors / 190.9M weights, 100.000%
+bit-identical** to the source bf16 weights at 12.10 bpw (325 MB vs 264 MB
+for the lossy 11.5 bpw file). Exact zeros need no entry (the zero marker
+already decodes them), so all-zero tensors cost only the header.
+
+The GGUF converter writes these tables with `--lossless`
+(`<tensor>.ovf`, I8). Applying them inside llama.cpp needs a sparse-MM
+correction op (`out += W_ovf @ x`), which is the next integration step;
+the default 11.5 bpw output remains unchanged.
+
 ### Lossless variant (`bf16xl_lossless.py`)
 
 TRUE-lossless sibling at **14.12 bpw**: per 16-element group a 28-byte
