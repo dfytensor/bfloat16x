@@ -305,8 +305,8 @@ u32 row_off[n_rows + 1]
 
 `pack_ovf()` / `apply_ovf()` / `dequantize_lossless()` produce and apply it.
 Verified on RWKV7-G1k-0.1B: **168 tensors / 190.9M weights, 100.000%
-bit-identical** to the source bf16 weights at 12.10 bpw (325 MB vs 264 MB
-for the lossy 11.5 bpw file). Exact zeros need no entry (the zero marker
+bit-identical** to the source bf16 weights at 12.17 bpw (325 MiB vs 264 MiB
+for the lossy 11.5 bpw file, +16.2 MB of tables). Exact zeros need no entry (the zero marker
 already decodes them), so all-zero tensors cost only the header.
 
 The GGUF converter writes these tables with `--lossless`
