@@ -326,9 +326,17 @@ Measured (RTX 4090 D, temp 0, weights 100% bit-exact):
 | Qwen2.5-3B | 4.14 GiB, 138.6 t/s | 4.40 GiB, 110.4 t/s | -20% |
 | MiniCPM5-1B | 1.45 GiB, 340.3 t/s | 1.53 GiB, 247.3 t/s | -27% |
 
-The correction is a per-tensor kernel launch, so small models pay mostly
-fixed overhead (~6 us x 170-253 tables); at 4B and above it is within 6-13%
-of the near-lossless file. The default 11.5 bpw output is unchanged.
+The correction runs as one small kernel per table inside the CUDA graph
+(measured: 0.65 us per graph node + 1.9-2.8 us per kernel). Three ways to
+cut it were tried and all were neutral or slower: folding the `add` into
+the sparse op (serializes the correction behind the GEMM), a wider inner
+loop (the kernel is latency-bound, not instruction-bound), and merging the
+q/k/v tables into one launch via a fused op (correct output, but the view
+nodes cost more than the two saved kernels). The remaining cost is the
+table traffic itself (284 MB/token at 3B) contending with the GEMMs, so it
+cannot be removed by launch-level tricks. Small models therefore pay a
+larger *relative* share; from 4B up the lossless file is within 6-13% of
+the near-lossless one. The default 11.5 bpw output is unchanged.
 
 ### Lossless variant (`bf16xl_lossless.py`)
 
