@@ -310,9 +310,12 @@ for the lossy 11.5 bpw file, +16.2 MB of tables). Exact zeros need no entry (the
 already decodes them), so all-zero tensors cost only the header.
 
 The GGUF converter writes these tables with `--lossless`
-(`<tensor>.ovf`, I8). Applying them inside llama.cpp needs a sparse-MM
-correction op (`out += W_ovf @ x`), which is the next integration step;
-the default 11.5 bpw output remains unchanged.
+(`<tensor>.ovf`, I8). llama.cpp applies them through two new ops,
+`GGML_OP_SPARSE_MM` and `GGML_OP_SPARSE_ROWS` (CPU + CUDA kernels), wired
+into the RWKV7 graph for every matmul and the token embedding, so the
+weights are bit-exact end to end. Cost at 13.3B (RTX 4090 D): 18.93 GiB
+vs 17.78 GiB (+6.5%), decode 28.7 vs 33.9 tok/s (-15%). The default
+11.5 bpw output is unchanged.
 
 ### Lossless variant (`bf16xl_lossless.py`)
 
