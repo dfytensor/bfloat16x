@@ -156,6 +156,46 @@ Quality holds on the second architecture too: Qwen2.5-3B ppl 6.7198 vs
 F16's 6.7192 (+/- 0.197). At 7B-8B sizes expect ~1.3x+; the effective
 bandwidth at 3B already reaches 658 GB/s (65% of peak).
 
+### RWKV7-G1k-13.3B (llama.cpp, RTX 4090 D 24GB)
+
+Real-model validation of the same GGUF/BF16X path on a 13.3B-parameter
+recurrent model (RWKV-7 "Goose"), converted from the official bf16
+checkpoint (`rwkv7-g1k-13.3b-20260930-ctx25600.pth`, 24.7 GiB):
+
+| | |
+|---|---|
+| Checkpoint | 24.7 GiB bf16 (does not fit in 24 GB VRAM) |
+| **BF16X GGUF** | **17.78 GB** (1714 tensors; matrices BF16X, 1-D params f32) |
+| Decode (llama-bench tg128) | **33.65 ± 0.07 t/s** |
+| Prefill (llama-bench pp256) | 1656 t/s |
+| Effective bandwidth | 598 GB/s (measured device read ceiling: 888 GB/s) |
+| GPU kernel breakdown (nsys) | 85% BF16X GEMV, 15% elementwise/norm/LoRA |
+
+Quality: greedy next-token distribution after the prompt, compared with
+the reference PyTorch/numpy implementation run on the source safetensors:
+
+| Prompt | BF16X GGUF | Reference |
+|---|---|---|
+| The Eiffel tower is in the city of | `' Paris'` p=0.605 | `' Paris'` p=0.598 |
+| The capital of France is | `' Paris'` p=0.483 | `' Paris'` p=0.521 |
+
+Tensor-level round-trip (GGUF decode vs safetensors source) is ~98%
+bit-exact on every tensor class (attention/FFN matrices, LoRA matrices,
+embeddings, output head), with max relative error ~1e-3, i.e. only the
+bf16x block quantization itself.
+
+Scale context: an F16 13.3B needs 26.6 GB and cannot run on a 24 GB card;
+BF16X makes it fit with ~5 GB to spare and reads 1.39x fewer bytes per
+token. In the same llama.cpp CUDA build the effective bandwidth is
+598 GB/s, versus 513 GB/s for the official RWKV7-G1 2.9B fp16 entry on a
+4090 in the RWKV performance database and 674 GB/s for llama.cpp's
+best-tuned dense Q4_0 path - within 11% of a mature dense-quant kernel
+while carrying the ~15% RWKV-specific fixed overhead (many small
+elementwise/LoRA kernels per layer).
+
+Converter and reference checker: `convert_rwkv7_to_gguf.py` and
+`compare_rwkv7_ref.py` in the llama.cpp PR branch (#29896).
+
 ### v8 fused kernel (`bf16x_fused.py`)
 
 Single-token GEMV with in-register decode — the bf16 weight **never
