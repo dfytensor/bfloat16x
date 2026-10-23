@@ -1,10 +1,10 @@
 # BF16X — BFloat16 Lossless Compression
 
-> **100% bit-identical** decompression, **2.08× compression ratio**, full Triton GPU kernel.
+> **11.5 bpw / 1.39×** near-lossless GGUF block format (PPL 21.0076 vs 21.0155); **12.17 bpw / 1.315×** with the overflow side table for **100% bit-identical** reconstruction. Full Triton GPU kernel.
 > **v8: fused decode+GEMV — generation speed parity with bf16** (34.8 vs 33-36 ms/tok on MiniCPM5-1B).
 > **v9: fused decode+GEMM — multi-token/prefill** (8B image model t2i: 103 s → 56 s/image, 1.84×, 24 GB GPU).
 
-BF16X compresses bfloat16 model weights losslessly by exploiting exponent redundancy: adjacent weights share an `emax` (8-bit per 16 elements), with individual deltas stored in only 3 bits. Sign + mantissa are packed as bit-streams. Overflows (rare delta ≥ 7) are handled by a Triton-based sparse fix kernel.
+BF16X compresses bfloat16 model weights near-losslessly (bit-exactly with the overflow side table) by exploiting exponent redundancy: adjacent weights share an `emax` (8-bit per 16 elements), with individual deltas stored in only 3 bits. Sign + mantissa are packed as bit-streams. Overflows (rare delta ≥ 7) are handled by a Triton-based sparse fix kernel.
 
 ## Platform & Versions
 
@@ -265,7 +265,7 @@ Format `bf16x-v1`: `<prefix>.safetensors` holds flat streams per layer
 per-tensor offsets/shapes. WDDM note: stream pinned pools in ≤256 MB chunks —
 repeated multi-GB pins fragment the Windows host allocator.
 
-- **Disk compression**: 2161MB → 1041MB (2.08×)
+- **Disk compression (legacy `bf16x-v1` safetensors layout)**: 2161MB → 1041MB (2.08×, ~7.7 bpw). The deployed GGUF block format is 11.5 bpw / 1.39×.
 - **Triton kernels**: 100% of decode pipeline
 - **Global shared buffer**: 1 decode buffer reused across all 168 layers
 
@@ -280,7 +280,7 @@ round-trip self-test: `bf16x_gguf_block.py`.
   emax[2]   one byte per 16-weight half = shared max bf16 exponent
   sgn[4]    32 sign bits, LSB-first
   mant[28]  32 x 7-bit mantissas, LSB-first bit order
-  delta[12] 32 x 3-bit exponent deltas, LSB-first; 7 = saturate (exp = emax-7)
+  delta[12] 32 x 3-bit exponent deltas, LSB-first; 7 = zero marker (exp = 0)
 ```
 
 Weights within 6 exponents of their half-block max decode bit-identical to
@@ -289,7 +289,7 @@ always exact. Measured end-to-end in llama.cpp on MiniCPM5-1B
 (wikitext-2 test, RTX 4090): PPL 21.0076 vs F16's 21.0155 (+/- 0.17) at
 11.50 BPW.
 
-#### Bit-exact extension (overflow side table, ~12.1 bpw)
+#### Bit-exact extension (overflow side table, 12.17 bpw)
 
 `quantize_blocks()` clamps every exponent delta >= 7 to the zero marker,
 which is the only lossy part of the format: ~1.9% of real weights (the ones
@@ -310,12 +310,25 @@ for the lossy 11.5 bpw file, +16.2 MB of tables). Exact zeros need no entry (the
 already decodes them), so all-zero tensors cost only the header.
 
 The GGUF converter writes these tables with `--lossless`
-(`<tensor>.ovf`, I8). llama.cpp applies them through two new ops,
-`GGML_OP_SPARSE_MM` and `GGML_OP_SPARSE_ROWS` (CPU + CUDA kernels), wired
-into the RWKV7 graph for every matmul and the token embedding, so the
-weights are bit-exact end to end. Cost at 13.3B (RTX 4090 D): 18.93 GiB
-vs 17.78 GiB (+6.5%), decode 28.7 vs 33.9 tok/s (-15%). The default
-11.5 bpw output is unchanged.
+(`<tensor>.ovf`, I8), and `add_ovf_gguf.py` grafts them onto an existing
+F16/BF16X pair. llama.cpp pairs every BF16X tensor with its side table
+inside `llama_model_base::create_tensor` and applies the corrections in
+`build_lora_mm()` / `build_inp_embd()`, so **any architecture** gets the
+bit-exact path without per-model code. The two new ops are
+`GGML_OP_SPARSE_MM` and `GGML_OP_SPARSE_ROWS` (CPU + CUDA kernels).
+
+Measured (RTX 4090 D, temp 0, weights 100% bit-exact):
+
+| model | 11.5 bpw | 12.17 bpw | decode delta |
+|---|---|---|---|
+| RWKV7-G1k-13.3B | 17.78 GiB, 33.5 t/s | 18.93 GiB, 29.1 t/s | -13% |
+| Spark-X2.6-4B | 5.51 GiB, 95.0 t/s | 5.80 GiB, 88.8 t/s | -6% |
+| Qwen2.5-3B | 4.14 GiB, 138.6 t/s | 4.40 GiB, 110.4 t/s | -20% |
+| MiniCPM5-1B | 1.45 GiB, 340.3 t/s | 1.53 GiB, 247.3 t/s | -27% |
+
+The correction is a per-tensor kernel launch, so small models pay mostly
+fixed overhead (~6 us x 170-253 tables); at 4B and above it is within 6-13%
+of the near-lossless file. The default 11.5 bpw output is unchanged.
 
 ### Lossless variant (`bf16xl_lossless.py`)
 
