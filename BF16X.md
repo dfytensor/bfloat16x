@@ -1,6 +1,6 @@
 # BF16X — bfloat16 无损压缩格式
 
-> 100% bit-identical 还原，2.08× 压缩比。全 Triton 内核 GPU 实时解码，省显存。
+> 100% bit-identical 还原（带 overflow 表，12.17bpw）；GGUF 部署格式 11.5bpw / 1.39× 近无损。全 Triton 内核 GPU 实时解码，省显存。
 
 ## 原理
 
@@ -9,13 +9,13 @@ bf16 = 16 bit：符号(1) + 指数(8) + 尾数(7)。相邻权重指数通常相�
 ```
 原始 bf16:  [s][eeeeeeee][mmmmmmm]    16 bit/元素
 BF16X:      emax(8bit/16元素) + sign(1bit流) + mant(7bit流) + delta(3bit流)
-有效 BPW:   ~11.5 bit/元素  →  2.08× 压缩 (实测 MiniCPM5-1B)
+有效 BPW:   11.5 bit/元素（GGUF 基础格式）→ 1.39× 压缩；带 overflow 表 12.17bpw → 1.315×
 ```
 
 - 每 16 元素共享 1 个 emax
 - delta = emax - 指数，绝大多数 0~6（3bit 够用）
 - delta ≥ 7 的元素稀疏存储 (overflow 表, ~1.9% 权重)
-- 解压时完全重建原始 bf16 位模式 → **100% 无损**
+- 解压时带 overflow 表可完全重建原始 bf16 位模式 → **100% 无损**；基础 11.5bpw 是近无损（delta=7 的权重指数置 0）
 
 ## MiniCPM5-1B 实测 (RTX 4090 24GB)
 
@@ -26,7 +26,7 @@ BF16X:      emax(8bit/16元素) + sign(1bit流) + mant(7bit流) + delta(3bit流)
 | BF16X CPU 流式 | 128ms | **0.9GB** | 56.02 | 100% 无损 |
 | DG 4-bit 打包 | 112ms | 1.4GB | 61.50 | +10% 有损可微调 |
 
-- **磁盘压缩**: 2161MB → 1041MB (2.08×)
+- **磁盘压缩（legacy `bf16x-v1` safetensors）**: 2161MB → 1041MB (2.08×, ~7.7bpw)
 - **Triton 内核**: 20μs/层 (2048×1536 = 3.15M 权重)
 - **全模型**: 168 层 Linear, 全 Triton 解码, 无 PyTorch 后处理
 
